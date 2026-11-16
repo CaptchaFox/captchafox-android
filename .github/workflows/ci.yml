@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: JVM tests and build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Test and build the libraries and the example app
+        run: ./gradlew test assemble
+
+      # The device jobs below split deviceTest; a task of deviceTest that no job runs, or a job outside it, fails here.
+      - name: Check that the device jobs run deviceTest
+        run: |
+          gradle_tasks="$(./gradlew -q deviceTest --dry-run | sed -n 's/^\(:.*:testDeviceDebugAndroidTest\) SKIPPED$/\1/p' | sort -u)"
+          job_tasks="$(sed -n "s/^ *task: '\(:.*\)'$/\1/p" .github/workflows/ci.yml | sort -u)"
+          if [ "$gradle_tasks" != "$job_tasks" ]; then
+            echo "::error::deviceTest runs $(echo $gradle_tasks), the device jobs run $(echo $job_tasks)."
+            exit 1
+          fi
+
+  device-tests:
+    name: Device tests (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      # Each part on an emulator of its own; together they run every test of deviceTest.
+      matrix:
+        include:
+          - name: dialog
+            task: ':captchafox-android:testDeviceDebugAndroidTest'
+            filter: '-Pandroid.testInstrumentationRunnerArguments.class=com.captchafox.android.DialogTest'
+          - name: execute
+            task: ':captchafox-android:testDeviceDebugAndroidTest'
+            filter: '-Pandroid.testInstrumentationRunnerArguments.class=com.captchafox.android.ExecuteTest'
+          - name: other view tests
+            task: ':captchafox-android:testDeviceDebugAndroidTest'
+            filter: '-Pandroid.testInstrumentationRunnerArguments.notClass=com.captchafox.android.DialogTest,com.captchafox.android.ExecuteTest'
+          - name: compose
+            task: ':captchafox-android-compose:testDeviceDebugAndroidTest'
+            filter: ''
+          - name: public interface
+            task: ':public-interface-tests:testDeviceDebugAndroidTest'
+            filter: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      # The managed device's emulator needs about 7.4 GB free for its data partition; the runner has less once Gradle
+      # has downloaded the system image.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/ndk
+          df -h /
+
+      # The managed device's emulator needs KVM.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # The runner has 7.8 GB. Gradle's emulator that creates the device's snapshot can still be running when the test
+      # emulator starts; two of them, with the build's daemons, exhausted the memory and the runner was lost. So the
+      # APKs and the snapshot come first, the daemons stop and that emulator ends before the tests start.
+      - name: Build the test APKs and the device's snapshot
+        env:
+          TASK: ${{ matrix.task }}
+        run: |
+          ./gradlew "${TASK%:*}:assembleDebugAndroidTest" "${TASK%:*}:testDeviceSetup" -Pkotlin.compiler.execution.strategy=in-process -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect
+          ./gradlew --stop
+          # The snapshot's emulator may outlive Gradle; the test's emulator can start beside it.
+          timeout 300 sh -c 'while pgrep qemu-system > /dev/null; do sleep 2; done' || echo "::warning::The snapshot's emulator is still running."
+
+      # A stalled emulator ends the step with its log instead of holding the runner.
+      - name: Test
+        timeout-minutes: 30
+        run: ./gradlew ${{ matrix.task }} ${{ matrix.filter }} -Dorg.gradle.jvmargs=-Xmx1536m -Pkotlin.compiler.execution.strategy=in-process -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect
+
+      # The test report stays on the runner; its failures go to the log.
+      - name: Show the failed tests
+        if: failure()
+        run: |
+          for f in */build/outputs/androidTest-results/managedDevice/debug/testDevice/TEST-*.xml; do
+            grep -B3 -A20 '<failure' "$f" || true
+          done
+          # A crash of the emulator's system, which ends the test run.
+          grep -h -A25 -e 'FATAL EXCEPTION IN SYSTEM PROCESS' -e 'WATCHDOG KILLING' -e 'Low on memory' -e 'lowmemorykiller' \
+            */build/outputs/androidTest-results/managedDevice/debug/testDevice/logcat-*.txt | head -150 || true

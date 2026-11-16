@@ -1,0 +1,89 @@
+name: Release
+
+# Runs when a version tag is pushed: publishes both artifacts to Maven Central, then creates the GitHub release. Tags on
+# a commit that is not on main, or whose version or changelog does not match, are refused before anything is published.
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+concurrency: release
+
+jobs:
+  release:
+    name: Release ${{ github.ref_name }}
+    runs-on: ubuntu-24.04
+    permissions:
+      # Creates the GitHub release.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, so that the check below can see whether the tag is on main.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check that the tag points to a commit on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points to $(git rev-parse --short HEAD), which is not on main. Tag the tested commit on main."
+            exit 1
+          fi
+
+      - name: Check the version in gradle.properties and the changelog
+        run: .github/scripts/check-release.sh "$GITHUB_REF_NAME" "$RUNNER_TEMP/notes.md"
+
+      # Without a cache, so that nothing from another run enters the published artifacts.
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The managed device's emulator needs about 7.4 GB free for its data partition; the runner has less once Gradle
+      # has downloaded the system image.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/ndk
+          df -h /
+
+      # The managed device's emulator needs KVM.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # The runner has 7.8 GB: the emulator that creates the device's snapshot and the build's daemons end before the
+      # test emulator starts, as two emulators with the daemons exhaust the memory.
+      - name: Test, and build the test APKs and the device's snapshot
+        run: |
+          ./gradlew test assembleDebugAndroidTest :captchafox-android:testDeviceSetup -Pkotlin.compiler.execution.strategy=in-process -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect
+          ./gradlew --stop
+          # The snapshot's emulator may outlive Gradle; the test's emulator can start beside it.
+          timeout 300 sh -c 'while pgrep qemu-system > /dev/null; do sleep 2; done' || echo "::warning::The snapshot's emulator is still running."
+
+      # The device tests of all modules on one emulator; a stalled emulator ends the step instead of holding the runner.
+      - name: Device tests
+        timeout-minutes: 90
+        run: ./gradlew deviceTest -Dorg.gradle.jvmargs=-Xmx1536m -Pkotlin.compiler.execution.strategy=in-process -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect
+
+      - name: Sign and publish to Maven Central
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_GPG_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: ./gradlew publishAndReleaseToMavenCentral
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            captchafox-android/build/outputs/aar/captchafox-android-release.aar \
+            captchafox-android-compose/build/outputs/aar/captchafox-android-compose-release.aar \
+            --verify-tag \
+            --title "CaptchaFox for Android ${GITHUB_REF_NAME}" \
+            --notes-file "$RUNNER_TEMP/notes.md"
