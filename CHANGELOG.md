@@ -1,4 +1,4 @@
-## Unreleased
+## 1.0.0
 
 - Show the CaptchaFox widget in Android apps and hand its token to the app: `CaptchaFoxView` and `CaptchaFoxDialog`
   (`com.captchafox:captchafox-android`), `CaptchaFoxWidget` and `CaptchaFoxDialog` for Compose
